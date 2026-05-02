@@ -414,3 +414,127 @@ def prepare_vae_context(
 
     model.eval()
     return model, device, normal_loader, test_loader
+
+
+# ============ PHASE 1: Synthetic Data Generation ============
+
+def generate_synthetic_wrong_way_samples(
+    normal_source: str | Path,
+    output_dir: str | Path = "vae_wrong_way_samples",
+) -> Path:
+    """Generate synthetic wrong-way via temporal reverse + horizontal flip using ffmpeg."""
+    import subprocess
+    normal_path = Path(normal_source)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    for side in ["left", "right"]:
+        (output_path / side).mkdir(exist_ok=True)
+    
+    source_videos = []
+    if normal_path.is_file() and normal_path.suffix.lower() in VIDEO_SUFFIXES:
+        source_videos.append(normal_path)
+    elif normal_path.is_dir():
+        for p in sorted(normal_path.glob("**/*")):
+            if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES:
+                source_videos.append(p)
+    
+    if not source_videos:
+        raise RuntimeError(f"No source videos found in {normal_source}")
+    
+    for src_video in source_videos:
+        sides = ["left"] if "left" in src_video.parent.name.lower() else (["right"] if "right" in src_video.parent.name.lower() else ["left", "right"])
+        for side in sides:
+            out_file = output_path / side / src_video.name
+            if out_file.exists():
+                print(f"Skipping {out_file}")
+                continue
+            try:
+                cmd = ["ffmpeg", "-i", str(src_video), "-vf", "reverse,hflip", "-c:v", "libx264", "-preset", "fast", "-crf", "23", str(out_file)]
+                print(f"Generating: {side}/{src_video.name}")
+                subprocess.run(cmd, check=True, capture_output=True)
+            except Exception as e:
+                print(f"Warning: {e}")
+    return output_path
+
+
+# ============ PHASE 2: GANomaly Architecture ============
+
+class GANomaly(nn.Module):
+    """Encoder-Generator-Discriminator for anomaly detection."""
+    def __init__(self, seq_len: int = 8, latent_dim: int = 64, hidden_dim: int = 128, emb_dim: int = 128, img_size: int = 64):
+        super().__init__()
+        self.seq_len, self.latent_dim = seq_len, latent_dim
+        self.frame_encoder = FrameEncoder(emb_dim=emb_dim)
+        self.temporal_encoder = nn.LSTM(emb_dim, hidden_dim, batch_first=True)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_gen = nn.Linear(latent_dim, hidden_dim)
+        self.temporal_generator = nn.LSTM(hidden_dim, emb_dim, batch_first=True)
+        self.frame_decoder = FrameDecoder(emb_dim=emb_dim, out_size=img_size)
+        self.discriminator = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=(3,4,4), stride=(1,2,2), padding=(1,1,1)),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(32, 64, kernel_size=(3,4,4), stride=(1,2,2), padding=(1,1,1)),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool3d((1,1,1)),
+            nn.Flatten(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c, h, w = x.shape
+        feats = self.frame_encoder(x.view(b*t,c,h,w)).view(b,t,-1)
+        _, (h_n, _) = self.temporal_encoder(feats)
+        return self.fc_mu(h_n[-1])
+    def generate(self, z: torch.Tensor) -> torch.Tensor:
+        b = z.shape[0]
+        dec_feats, _ = self.temporal_generator(self.fc_gen(z).unsqueeze(1).expand(b, self.seq_len, -1))
+        frames = self.frame_decoder(dec_feats.reshape(b*self.seq_len, -1))
+        return frames.view(b, self.seq_len, 1, frames.shape[-2], frames.shape[-1])
+    def discriminate(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c, h, w = x.shape
+        return self.discriminator(x.view(b,c,t,h,w))
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z = self.encode(x)
+        return self.generate(z), z
+    def anomaly_score(self, x: torch.Tensor) -> np.ndarray:
+        gen, _ = self.forward(x)
+        return torch.mean((x - gen)**2, dim=(1,2,3,4)).detach().cpu().numpy()
+
+def train_ganomaly(model: GANomaly, loader: DataLoader, device: torch.device, epochs: int = 10, lr_gen: float = 1e-4, lr_disc: float = 5e-5) -> dict:
+    """Train GANomaly with alternating Generator/Discriminator updates."""
+    model.to(device)
+    encoder_params = (list(model.frame_encoder.parameters()) + list(model.temporal_encoder.parameters()) +
+                      list(model.fc_mu.parameters()) + list(model.fc_gen.parameters()) + 
+                      list(model.temporal_generator.parameters()) + list(model.frame_decoder.parameters()))
+    optim_gen = torch.optim.Adam(encoder_params, lr=lr_gen)
+    optim_disc = torch.optim.Adam(model.discriminator.parameters(), lr=lr_disc)
+    criterion_bce, criterion_mse = nn.BCELoss(), nn.MSELoss()
+    losses = {"gen": [], "disc": []}
+    for epoch in range(epochs):
+        gen_losses, disc_losses = [], []
+        for (x,) in loader:
+            x = x.to(device)
+            b = x.shape[0]
+            label_real, label_fake = torch.ones(b,1,device=device), torch.zeros(b,1,device=device)
+            optim_disc.zero_grad(set_to_none=True)
+            gen, _ = model(x)
+            loss_disc = criterion_bce(model.discriminate(x), label_real) + criterion_bce(model.discriminate(gen.detach()), label_fake)
+            loss_disc.backward()
+            optim_disc.step()
+            disc_losses.append(float(loss_disc.detach().cpu()))
+            optim_gen.zero_grad(set_to_none=True)
+            gen, _ = model(x)
+            loss_gen = criterion_mse(gen, x) + criterion_bce(model.discriminate(gen), label_real)
+            loss_gen.backward()
+            optim_gen.step()
+            gen_losses.append(float(loss_gen.detach().cpu()))
+        losses["gen"].append(np.mean(gen_losses)); losses["disc"].append(np.mean(disc_losses))
+        if (epoch+1) % max(1, epochs//5) == 0:
+            print(f"GANomaly {epoch+1}/{epochs}: gen={losses['gen'][-1]:.6f}, disc={losses['disc'][-1]:.6f}")
+    return losses
+
+def ganomaly_anomaly_score(model: GANomaly, batch: torch.Tensor, device: torch.device) -> np.ndarray:
+    """Compute anomaly score (reconstruction error) for batch."""
+    model.eval()
+    with torch.no_grad():
+        return model.anomaly_score(batch.to(device))

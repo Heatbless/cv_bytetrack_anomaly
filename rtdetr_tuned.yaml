@@ -1,0 +1,40 @@
+# RT-DETR Tracking Tuning Profile
+# ================================
+# RT-DETR provides vehicle detections; ByteTrack association backend handles multi-object tracking.
+# Tuned for traffic monitoring: vehicle counting, line-crossing detection, anomaly flagging.
+
+# Core Tracker Configuration
+tracker_type: bytetrack  # ByteTrack: efficient multi-object tracking
+
+# Detection Confidence Thresholds
+# High threshold: only keep detections >50% confidence (filter noise, reduce tracking jitter)
+track_high_thresh: 0.50
+# Low threshold: tentative detections 20-70% (recover missed frames in motion blur/occlusion)
+track_low_thresh: 0.20
+# New track threshold: require >70% confidence to initiate new track (prevents ghost detections)
+new_track_thresh: 0.70
+
+# Track Management
+# Buffer: keep tracks alive for 200 frames (~6.7sec @ 30fps) despite missing detections
+# Prevents ID switches for momentary occlusions (shadows, lane changes, intersections)
+track_buffer: 200
+# Match threshold: require >95% similarity to associate detection with existing track
+# High value = strict matching, prevents ID swaps but may drop brief occlusions
+match_thresh: 0.95
+
+# Fusion & Detection Integration
+# Fuse detection scores with appearance features for more robust association
+# This helps maintain track identity during partial occlusions or crowded scenes, common in traffic monitoring.
+fuse_score: true
+
+# BoT-SORT Advanced Parameters
+# # Global Motion Compensation: 'none' = disabled (vehicle speeds variable, not constant global motion)
+# gmc_method: none
+# # ReID (Re-Identification): disabled - not using appearance descriptors, keeping computational cost low
+# with_reid: false
+# # Appearance model: 'auto' = let detector choose (RT-DETR uses bounding boxes + motion)
+# model: auto
+# # Proximity threshold: spatial distance weighting for association (0.5 = moderate strictness)
+# proximity_thresh: 0.5
+# # Appearance threshold: similarity score cutoff for visual features (0.8 = high confidence match)
+# appearance_thresh: 0.8
