@@ -13,6 +13,9 @@ import cv2
 import numpy as np
 
 
+TARGET_EXPORT_SIZE = (1280, 720)
+
+
 @dataclass
 class Segment:
     start_frame: int
@@ -562,24 +565,50 @@ class VAESampleSplicerGUI(tk.Tk):
         messagebox.showinfo("Done", f"Exported {len(self.segments)} clips to:\n{output_dir}")
         self._log(f"Manifest written: {manifest_path}")
 
+    def _pick_fourcc(self, output_path: Path) -> int:
+        if output_path.suffix.lower() == ".avi":
+            return cv2.VideoWriter_fourcc(*"XVID")
+        return cv2.VideoWriter_fourcc(*"avc1")
+
+    def _resize_frame(self, frame: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+        src_h, _ = frame.shape[:2]
+        interp = cv2.INTER_AREA if src_h > out_h else cv2.INTER_LINEAR
+        return cv2.resize(frame, (out_w, out_h), interpolation=interp)
+
     def _write_segment(self, seg: Segment, output_path: Path) -> None:
+        if self.video_path is None:
+            raise RuntimeError("No source video loaded")
+
+        out_w, out_h = TARGET_EXPORT_SIZE
+        fps_out = max(self.fps, 1.0)
+
         cap = cv2.VideoCapture(str(self.video_path))
         if not cap.isOpened():
-            raise RuntimeError(f"Could not reopen video: {self.video_path}")
+            raise RuntimeError(f"Could not open source video: {self.video_path}")
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, seg.start_frame)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(output_path), fourcc, self.fps, (self.frame_width, self.frame_height))
+        fourcc = self._pick_fourcc(output_path)
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps_out, (out_w, out_h))
 
-        frames_to_write = seg.end_frame - seg.start_frame + 1
-        for _ in range(max(0, frames_to_write)):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            writer.write(frame)
+        if not writer.isOpened() and output_path.suffix.lower() != ".avi":
+            # Fallback codec for systems where avc1 is not available.
+            writer.release()
+            writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps_out, (out_w, out_h))
 
-        writer.release()
-        cap.release()
+        if not writer.isOpened():
+            cap.release()
+            writer.release()
+            raise RuntimeError(f"Could not open writer for output: {output_path}")
+
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, seg.start_frame)
+            for _ in range(seg.start_frame, seg.end_frame + 1):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                writer.write(self._resize_frame(frame, out_w, out_h))
+        finally:
+            cap.release()
+            writer.release()
 
     def _on_close(self) -> None:
         self._stop_playback()

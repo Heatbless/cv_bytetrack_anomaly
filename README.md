@@ -147,6 +147,8 @@ Cell 5 currently uses:
 - `VAE_NORMAL_SOURCE_LEFT = "vae_split_samples/left"`
 - `VAE_NORMAL_SOURCE_RIGHT = "vae_split_samples/right"`
 
+- Note: synthetic reversed-sample generation (`vae_wrong_way_samples`) has been removed from the notebook; training now uses only normal split samples (no reversed/synthetic samples are merged into the VAE training set).
+
 Cell 6 writes split anomaly output:
 
 - `vae_anomaly_scores_split_lr.csv`

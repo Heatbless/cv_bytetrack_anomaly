@@ -5,6 +5,8 @@ build/
 dist/
 wheels/
 *.egg-info
+.vscode/
+.DS_Store
 
 # Custom
 *.mp4

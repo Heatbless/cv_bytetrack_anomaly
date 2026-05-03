@@ -10,6 +10,7 @@ import cv2
 
 
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v"}
+TARGET_OUTPUT_HEIGHT = 720
 
 
 @dataclass
@@ -124,13 +125,6 @@ def list_videos(path: Path, recursive: bool) -> list[Path]:
     return videos
 
 
-def pick_fourcc(suffix: str) -> int:
-    suffix = suffix.lower()
-    if suffix == ".avi":
-        return cv2.VideoWriter_fourcc(*"XVID")
-    return cv2.VideoWriter_fourcc(*"mp4v")
-
-
 def compute_divider_x(width: int, explicit_divider: int | None, hint: DividerHint, fallback_ratio: float) -> int:
     if explicit_divider is not None:
         return clamp_divider(explicit_divider, width)
@@ -150,6 +144,19 @@ def clamp_divider(divider_x: int, width: int) -> int:
     return max(1, min(width - 1, int(divider_x)))
 
 
+def pick_fourcc(suffix: str) -> int:
+    suffix = suffix.lower()
+    if suffix == ".avi":
+        return cv2.VideoWriter_fourcc(*"XVID")
+    return cv2.VideoWriter_fourcc(*"avc1")
+
+
+def _resize_for_output(frame: cv2.typing.MatLike, out_w: int, out_h: int) -> cv2.typing.MatLike:
+    src_h, _ = frame.shape[:2]
+    interp = cv2.INTER_AREA if src_h > out_h else cv2.INTER_LINEAR
+    return cv2.resize(frame, (out_w, out_h), interpolation=interp)
+
+
 def split_one_video(
     video_path: Path,
     rel_path: Path,
@@ -164,8 +171,10 @@ def split_one_video(
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    fps = fps if fps > 0 else 30.0
+    original_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    original_fps = original_fps if original_fps > 0 else 30.0
+    target_fps = 15
+    skip_interval = max(1, int(original_fps / target_fps))
 
     divider_x = clamp_divider(divider_x, width)
     buffer_px = max(0, int(buffer_px))
@@ -174,6 +183,9 @@ def split_one_video(
     right_x1 = min(width - 1, max(0, divider_x + buffer_px))
     left_w = left_x2
     right_w = width - right_x1
+    target_h = TARGET_OUTPUT_HEIGHT
+    left_out_w = max(2, int(round(left_w * target_h / max(height, 1))))
+    right_out_w = max(2, int(round(right_w * target_h / max(height, 1))))
 
     if left_w < 8 or right_w < 8:
         cap.release()
@@ -187,8 +199,16 @@ def split_one_video(
     out_right.parent.mkdir(parents=True, exist_ok=True)
 
     fourcc = pick_fourcc(video_path.suffix)
-    writer_left = cv2.VideoWriter(str(out_left), fourcc, fps, (left_w, height))
-    writer_right = cv2.VideoWriter(str(out_right), fourcc, fps, (right_w, height))
+    writer_left = cv2.VideoWriter(str(out_left), fourcc, target_fps, (left_out_w, target_h))
+    writer_right = cv2.VideoWriter(str(out_right), fourcc, target_fps, (right_out_w, target_h))
+
+    if (not writer_left.isOpened() or not writer_right.isOpened()) and video_path.suffix.lower() != ".avi":
+        # Fallback codec for wider Windows compatibility when avc1 is unavailable.
+        writer_left.release()
+        writer_right.release()
+        fallback = cv2.VideoWriter_fourcc(*"mp4v")
+        writer_left = cv2.VideoWriter(str(out_left), fallback, target_fps, (left_out_w, target_h))
+        writer_right = cv2.VideoWriter(str(out_right), fallback, target_fps, (right_out_w, target_h))
 
     if not writer_left.isOpened() or not writer_right.isOpened():
         cap.release()
@@ -197,14 +217,17 @@ def split_one_video(
         raise RuntimeError(f"Cannot open writer for outputs: {out_left} / {out_right}")
 
     try:
+        frame_counter = 0
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            left_frame = frame[:, :left_x2]
-            right_frame = frame[:, right_x1:]
-            writer_left.write(left_frame)
-            writer_right.write(right_frame)
+            if frame_counter % skip_interval == 0:
+                left_frame = _resize_for_output(frame[:, :left_x2], left_out_w, target_h)
+                right_frame = _resize_for_output(frame[:, right_x1:], right_out_w, target_h)
+                writer_left.write(left_frame)
+                writer_right.write(right_frame)
+            frame_counter += 1
     finally:
         cap.release()
         writer_left.release()
